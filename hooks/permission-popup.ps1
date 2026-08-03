@@ -17,6 +17,27 @@ Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 
+# Identify the calling agent from the hook payload. Returns "Claude Code",
+# "Codex", "Kimi Code", or "Agent" (unknown). Detection order favours the
+# transcript path, which is the most reliable signal, then falls back to
+# payload-only fields. Kimi Code is a Codex-family fork, so it is matched on its
+# own signals *before* the generic `turn_id` fallback that also flags Codex.
+function Get-AgentSource($d) {
+    $tp    = if ($d.transcript_path) { [string]$d.transcript_path } else { "" }
+    $model = if ($d.model)           { [string]$d.model }           else { "" }
+    $names = $d.PSObject.Properties.Name
+    if ($tp -match '(?i)[\\/]\.kimi[\\/]' -or $model -match '(?i)kimi|moonshot') {
+        return "Kimi Code"
+    }
+    if ($tp -match '(?i)[\\/]\.codex[\\/]' -or $model -match '(?i)^gpt' -or ($names -contains 'turn_id')) {
+        return "Codex"
+    }
+    if ($tp -match '(?i)[\\/]\.claude[\\/]' -or ($names -contains 'prompt_id') -or $model -match '(?i)claude') {
+        return "Claude Code"
+    }
+    return "Agent"
+}
+
 # Read JSON from stdin
 try {
     $reader = [System.IO.StreamReader]::new(
@@ -31,6 +52,11 @@ $toolName    = if ($data.tool_name) { $data.tool_name } else { "unknown" }
 $projectPath = if ($data.cwd)       { $data.cwd }       else { "unknown" }
 $toolInput   = $data.tool_input
 $popupMode   = if ($env:POPUP_MODE) { $env:POPUP_MODE.ToLower() } else { "full" }
+
+# Identify which agent triggered this hook so the popup is distinguishable.
+# Codex payloads carry a `model` (gpt-*), a `turn_id`, and a `.codex` transcript
+# path; Claude Code payloads carry `prompt_id`/`effort` and a `.claude` path.
+$sourceName = Get-AgentSource $data
 
 # auto mode: only surface AskUserQuestion
 if ($popupMode -eq "auto") {
@@ -87,6 +113,15 @@ if ($isDark) {
     $cParam  = "#F0F0F3"
 }
 
+# Accent colour per source — a glanceable cue when several windows stack up.
+switch ($sourceName) {
+    "Codex"       { $cAccent = "#10A37F" }  # OpenAI green
+    "Claude Code" { $cAccent = "#D97757" }  # Claude clay
+    "Kimi Code"   { $cAccent = "#7C5CFF" }  # Kimi violet
+    default       { $cAccent = $cTextS }
+}
+$xSource = xEsc $sourceName
+
 $global:exitCode = 2
 
 # ── AskUserQuestion popup ──────────────────────────────────────────────────────
@@ -96,7 +131,7 @@ if ($toolName -eq "AskUserQuestion") {
     $xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Claude Code" Width="400" SizeToContent="Height"
+        Title="$xSource" Width="400" SizeToContent="Height"
         WindowStartupLocation="CenterScreen" Topmost="True"
         ResizeMode="NoResize" Background="$cBg">
   <Window.Resources>
@@ -122,8 +157,10 @@ if ($toolName -eq "AskUserQuestion") {
   </Window.Resources>
   <Border Padding="24">
     <StackPanel>
-      <TextBlock Text="Claude Code — Question" FontFamily="Segoe UI Variable, Segoe UI"
-                 FontSize="11" Foreground="$cTextS" Margin="0,0,0,16"/>
+      <TextBlock FontFamily="Segoe UI Variable, Segoe UI" FontSize="11" Margin="0,0,0,16">
+        <Run Text="&#9679; $xSource" Foreground="$cAccent" FontWeight="SemiBold"/>
+        <Run Text="  &#183;  Question" Foreground="$cTextS"/>
+      </TextBlock>
       <TextBlock Text="$xQuestion" FontFamily="Segoe UI Variable, Segoe UI"
                  FontSize="14" Foreground="$cTextP" TextWrapping="Wrap" Margin="0,0,0,16"/>
       <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
@@ -132,7 +169,7 @@ if ($toolName -eq "AskUserQuestion") {
       </StackPanel>
       <TextBlock Text="$xProjP" FontFamily="Segoe UI Variable, Segoe UI"
                  FontSize="11" Foreground="$cTextS" TextWrapping="Wrap" Margin="0,0,0,16"/>
-      <TextBlock Text="Switch to the Claude Code window to answer."
+      <TextBlock Text="Switch to the $xSource window to answer."
                  FontFamily="Segoe UI Variable, Segoe UI" FontSize="12" Foreground="$cTextS"
                  FontStyle="Italic" Margin="0,0,0,20"/>
       <Button x:Name="BtnOK" Content="OK" Style="{StaticResource Btn}" HorizontalAlignment="Right"/>
@@ -152,7 +189,7 @@ if ($toolName -eq "AskUserQuestion") {
 $xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Claude Code" Width="420" SizeToContent="Height"
+        Title="$xSource" Width="420" SizeToContent="Height"
         WindowStartupLocation="CenterScreen" Topmost="True"
         ResizeMode="NoResize" Background="$cBg">
   <Window.Resources>
@@ -196,8 +233,10 @@ $xaml = @"
   </Window.Resources>
   <Border Padding="24">
     <StackPanel>
-      <TextBlock Text="Claude Code Permission" FontFamily="Segoe UI Variable, Segoe UI"
-                 FontSize="11" Foreground="$cTextS" Margin="0,0,0,16"/>
+      <TextBlock FontFamily="Segoe UI Variable, Segoe UI" FontSize="11" Margin="0,0,0,16">
+        <Run Text="&#9679; $xSource" Foreground="$cAccent" FontWeight="SemiBold"/>
+        <Run Text="  &#183;  Permission" Foreground="$cTextS"/>
+      </TextBlock>
 
       <Border Background="$cSurface" CornerRadius="6" Padding="10,6"
               BorderThickness="1" BorderBrush="$cBorder"
