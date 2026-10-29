@@ -22,6 +22,26 @@ import subprocess
 import os
 import shutil
 
+# Keep dialogs small enough that the buttons always stay on screen
+MAX_LINE = 160
+MAX_QUESTIONS = 4
+MAX_PARAMS = 300
+QUESTION_TIMEOUT_SEC = 120
+
+# Text is passed via argv so no AppleScript string escaping is needed
+DIALOG_SCRIPT = """
+on run argv
+    set {msg, ttl, btns, giveUp} to {item 1 of argv, item 2 of argv, item 3 of argv, item 4 of argv as integer}
+    set AppleScript's text item delimiters to "|"
+    set btnList to text items of btns
+    if giveUp > 0 then
+        display dialog msg with title ttl buttons btnList default button (last item of btnList) giving up after giveUp
+    else
+        display dialog msg with title ttl buttons btnList default button (last item of btnList)
+    end if
+end run
+"""
+
 with open(sys.argv[1]) as f:
     try:
         data = json.load(f)
@@ -30,14 +50,12 @@ with open(sys.argv[1]) as f:
 
 tool_name    = data.get("tool_name", "unknown")
 project_path = data.get("cwd", "unknown")
-tool_input   = data.get("tool_input", {})
+tool_input   = data.get("tool_input") or {}
 popup_mode   = os.environ.get("POPUP_MODE", "full").lower()
 
 # --- auto mode: only surface AskUserQuestion ---
-if popup_mode == "auto":
-    if tool_name != "AskUserQuestion":
-        sys.exit(0)
-    # Fall through to show the question popup
+if popup_mode == "auto" and tool_name != "AskUserQuestion":
+    sys.exit(0)
 
 # --- full mode: skip read-only + user-configured tools ---
 if popup_mode != "auto":
@@ -53,56 +71,74 @@ if not shutil.which("osascript"):
 
 project_name = os.path.basename(project_path) or project_path
 
-def esc_as(s):
-    return (
-        s.replace("\\", "\\\\")
-         .replace('"', '\\"')
-         .replace("\n", "\\n")
-         .replace("\r", "")
-    )
+
+def clip(s, n):
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def dialog_args(msg, title, buttons, give_up=0):
+    return ["osascript", "-e", DIALOG_SCRIPT, msg, title, "|".join(buttons), str(give_up)]
+
+
+def summarize_questions(ti):
+    # Current payload: {"questions": [{question, header, options: [{label, ...}]}]}
+    # Legacy payload: {"question": "..."}
+    questions = ti.get("questions")
+    if not isinstance(questions, list):
+        return [clip(ti.get("question", "(no question text)"), MAX_LINE)]
+    lines = []
+    for q in questions[:MAX_QUESTIONS]:
+        if not isinstance(q, dict):
+            continue
+        header = q.get("header")
+        text = q.get("question", "")
+        lines.append(clip(f"• [{header}] {text}" if header else f"• {text}", MAX_LINE))
+        labels = [o.get("label", "") for o in q.get("options", []) if isinstance(o, dict)]
+        if labels:
+            lines.append(clip("   " + " / ".join(labels), MAX_LINE))
+    if len(questions) > MAX_QUESTIONS:
+        lines.append(f"…and {len(questions) - MAX_QUESTIONS} more")
+    return lines or ["(no question text)"]
+
+
+def summarize_params(name, ti):
+    if name == "Bash" and "command" in ti:
+        return clip(ti["command"], MAX_PARAMS)
+    if "file_path" in ti:
+        return clip(ti["file_path"], MAX_PARAMS)
+    return clip(json.dumps(ti, ensure_ascii=False), MAX_PARAMS)
+
 
 if tool_name == "AskUserQuestion":
-    question = tool_input.get("question", json.dumps(tool_input))
-    msg = (
-        f"Claude is asking you a question:\\n\\n"
-        f"{esc_as(question)}\\n\\n"
-        f"Project: {esc_as(project_name)}\\n"
-        f"Path: {esc_as(project_path)}\\n\\n"
-        f"Switch to the Claude Code window to answer."
+    msg = "\n".join(
+        ["Claude is asking you:", ""]
+        + summarize_questions(tool_input)
+        + ["", f"Project: {clip(project_name, MAX_LINE)}", "Switch to the Claude Code window to answer."]
     )
-    script = (
-        f'display dialog "{msg}" '
-        f'with title "Claude Code — Question" '
-        f'buttons {{"OK"}} '
-        f'default button "OK"'
+    # Informational only: don't block, or the question can't render until OK is clicked
+    subprocess.Popen(
+        dialog_args(msg, "Claude Code — Question", ["OK"], QUESTION_TIMEOUT_SEC),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
     )
-    subprocess.run(["osascript", "-e", script], capture_output=True)
     sys.exit(0)
 
 # Permission popup
-params = json.dumps(tool_input, ensure_ascii=False)
-if len(params) > 200:
-    params = params[:197] + "..."
-
-msg = (
-    f"Tool: {esc_as(tool_name)}\\n"
-    f"Project: {esc_as(project_name)}\\n"
-    f"Path: {esc_as(project_path)}\\n\\n"
-    f"Params: {esc_as(params)}"
+msg = "\n".join([
+    f"Tool: {clip(tool_name, MAX_LINE)}",
+    f"Project: {clip(project_name, MAX_LINE)}",
+    f"Path: {clip(project_path, MAX_LINE)}",
+    "",
+    summarize_params(tool_name, tool_input),
+])
+result = subprocess.run(
+    dialog_args(msg, "Claude Code Permission", ["Deny", "Allow"]),
+    capture_output=True, text=True,
 )
-script = (
-    f'display dialog "{msg}" '
-    f'with title "Claude Code Permission" '
-    f'buttons {{"Deny", "Allow"}} '
-    f'default button "Allow"'
-)
-
-result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
 if "Allow" in result.stdout:
     sys.exit(0)
-else:
-    print("Permission denied by user.")
-    sys.exit(2)
+print("Permission denied by user.")
+sys.exit(2)
 PYEOF
 
 exit $?
